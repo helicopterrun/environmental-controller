@@ -1,0 +1,429 @@
+esphome:
+  name: "environmental-controller"
+  friendly_name: "environmental-controller"
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: startup
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: VERBOSE
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "cnCCjJBI2LS/sG0PL8XeI6+cBEBO9xJ6KUDuM8gUm2M="
+
+ota:
+  - platform: esphome
+    password: "ec595f482f25ab3f3d0f6319b3683bbb"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+one_wire:
+  - platform: gpio
+    pin: 17
+
+i2c:
+  sda: 21
+  scl: 22
+  scan: true
+  id: i2c_main
+
+spi:
+  clk_pin: 14
+  mosi_pin: 12
+  miso_pin: 13
+
+mcp4728:
+  - id: dac_output
+    i2c_id: i2c_mux_4
+
+ads1115:
+  - address: 0x48
+    i2c_id: i2c_mux_4
+
+tca9548a:
+  - address: 0x70
+    id: i2c_multiplexer
+    i2c_id: i2c_main
+    channels:
+      - bus_id: i2c_mux_0
+        channel: 0
+      - bus_id: i2c_mux_1
+        channel: 1
+      - bus_id: i2c_mux_2
+        channel: 2
+      - bus_id: i2c_mux_3
+        channel: 3
+      - bus_id: i2c_mux_4
+        channel: 4
+      - bus_id: i2c_mux_5
+        channel: 5
+      - bus_id: i2c_mux_7
+        channel: 7
+
+script:
+  - id: startup
+    then:
+      - fan.turn_on: asp_fan
+      - light.turn_on:
+          id: ir_emmiter
+          brightness: 100%
+      - climate.control:
+          id: pid_mirror
+          mode: HEAT_COOL
+          target_temperature: 20
+#      - climate.control:
+#          id: pid_dew
+#          mode: "OFF"
+#      - wait_until:
+#          condition: 
+#            lambda: 'return !isnan(id(est_dewpoint).state);' 
+#      - script.execute: target_aquire
+
+#  - id: target_aquire
+#    then:
+#      - climate.control:
+#          id: pid_mirror
+#          mode: HEAT_COOL
+#          target_temperature: !lambda |-
+#            return id(est_dewpoint).state;
+#      - wait_until:
+#          condition: 
+#            lambda: 'return id(mirror_temp).state <= id(pid_mirror).target_temperature;' 
+#      - climate.control:
+#          id: pid_dew
+#          mode: HEAT_COOL
+#          target_temperature: 20
+
+binary_sensor:
+  - platform: analog_threshold
+    name: "Dew Saturated"
+    sensor_id: ir_bs
+    threshold: 10
+    filters:
+      - invert:
+
+sensor:
+  - platform: template
+    name: "PID Mirror Target Temp"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      return id(pid_mirror).target_temperature;
+
+#  - platform: pid
+#    name: "PID Cool Result"
+#    id: pid_cool
+#    type: COOL
+#    climate_id: pid_dew
+
+#  - platform: pid
+#    name: "PID Heat Result"
+#    id: pid_heat
+#    type: HEAT
+#    climate_id: pid_dew
+
+#  - platform: template
+#    name: "PID Dew Combined Output"
+#    id: pid_mux
+
+  - platform: template
+    name: "Dew Point"
+    id: dew_point
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      if (abs(id(ir_bs).state - 20.0) < 2.0) {
+        return id(mirror_temp).state;
+      } else {
+        return NAN;
+      }
+    filters:
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 12
+
+  # estimated dew point for initial fast targeting
+  - platform: template
+    name: "Estimated Dew Point"
+    id: est_dewpoint
+    device_class: temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    state_class: measurement
+    lambda: |-
+      float avp = id(actual_vapor_pressure).state;
+
+      if (isnan(avp)) {  // Corrected check for NaN on the actual vapor pressure state
+        return NAN;
+      }
+
+      float avp_log_div = log(avp / 0.6108);
+      float dew_point = (237.3 * avp_log_div) / (17.27 - avp_log_div);
+
+      return dew_point;
+    update_interval: 10s
+    on_value:
+      then:
+        - climate.control:
+            id: pid_mirror
+            mode: HEAT_COOL
+            target_temperature: !lambda |-
+              return id(est_dewpoint).state;
+
+  # Template sensor for Actual Vapor Pressure (Ea)
+  - platform: template
+    name: "Vapor Pressure"
+    id: actual_vapor_pressure
+    unit_of_measurement: "kPa"
+    accuracy_decimals: 3
+    lambda: |-
+      const float temperature = id(mirror_air_temp).state;
+      const float humidity = id(mirror_air_rh).state;
+
+      if (isnan(temperature) || isnan(humidity)) {
+        return NAN;
+      }
+      const float es = 0.6108 * exp((17.27 * temperature) / (temperature + 237.3));
+      const float ea = es * (humidity / 100.0);
+      return ea;
+    filters:
+      - round: 3
+    update_interval: 10s
+
+  - platform: sht3xd
+    temperature:
+      name: "Temperature"
+    humidity:
+      name: "Humidity"
+    address: 0x44
+    i2c_id: i2c_mux_0
+    update_interval: 60s
+
+  - platform: sht4x
+    i2c_id: i2c_mux_1
+    temperature:
+      name: "Onboard Temperature"
+    humidity:
+      name: "Onboard Relative Humidity"
+    update_interval: 60s
+
+  - platform: sht4x
+    i2c_id: i2c_mux_4
+    temperature:
+      name: "Mirror Air Flow Temperature"
+      id: mirror_air_temp
+    humidity:
+      name: "Mirror Air Flow Relative Humidity"
+      id: mirror_air_rh
+    update_interval: 10s
+
+  - platform: max31865
+    name: "Platinum RTD Temperature"
+    id: mirror_temp
+    cs_pin: 16
+    reference_resistance: 400 Ω
+    rtd_nominal_resistance: 100 Ω
+    rtd_wires: 3
+    update_interval: 1s
+    filters:
+      - filter_out: NaN
+
+  - platform: dallas_temp
+    name: "Dallas Temperature"
+    update_interval: 30s
+
+  - platform: adc
+    pin: 32
+    name: "Driver Current"
+    update_interval: 10s
+    attenuation: auto
+    filters:
+      - multiply: 1.221
+    unit_of_measurement: "A"
+
+  - platform: ads1115
+    multiplexer: 'A0_GND'
+    gain: 0.256
+    name: "Mirror IR Recieve"
+    id: ir_bs
+    unit_of_measurement: °C
+    filters:
+      - multiply: 1000
+    update_interval: 1s
+
+  - platform: pulse_counter
+    pin:
+      number: 34
+      mode:
+        input: True
+    name: "Fan RPM"
+    id: rpm_fan
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    count_mode:
+      rising_edge: INCREMENT
+      falling_edge: DISABLE
+    filters:
+      - multiply: 0.5
+      - round: 2
+    update_interval: 10s
+
+output:
+  - platform: ledc
+    pin: 5
+    id: pwm_pin
+    frequency: 100000Hz
+
+  - platform: ledc
+    pin: 18
+    id: fan_pwm
+    frequency: 25000Hz
+
+  - platform: gpio
+    pin: 15
+    id: fwd_rev
+
+  - platform: mcp4728
+    id: ir_led
+    mcp4728_id: dac_output
+    channel: C
+    vref: vdd
+
+  # tec outpout level
+  - platform: template
+    id: cool_output
+    type: float
+    write_action:
+      - output.turn_off: fwd_rev
+      - output.set_level:
+          id: pwm_pin
+          level: !lambda |-
+            return state;
+
+  - platform: template
+    id: heat_output
+    type: float
+    write_action:
+      - output.turn_on: fwd_rev
+      - output.set_level:
+          id: pwm_pin
+          level: !lambda |-
+            return state / 5;
+
+#  - platform: template
+#    id: more_dew
+#    type: float
+#    write_action:
+#      - sensor.template.publish:
+#          id: pid_mux
+#          state: !lambda 'return (id(pid_heat).state * 0.001) - (id(pid_cool).state * 0.005);'
+
+#  - platform: template
+#   id: less_dew
+#    type: float
+#    write_action:
+#      - sensor.template.publish:
+#          id: pid_mux
+#          state: !lambda 'return (id(pid_heat).state * 0.001) - (id(pid_cool).state * 0.005);'
+
+fan:
+  - platform: speed
+    output: fan_pwm
+    name: "Main Fan"
+    id: asp_fan
+
+light:
+  - platform: monochromatic
+    name: "IR LED"
+    id: ir_emmiter
+    output: ir_led
+
+climate:
+  - platform: pid
+    id: pid_mirror
+    name: "PID Mirror Temperature"
+    sensor: mirror_temp
+    default_target_temperature: 16°C
+    cool_output: cool_output
+    heat_output: heat_output
+    control_parameters:
+      kp: 1.21718
+      ki: 0.07902
+      kd: 4.68699
+
+#  - platform: pid
+#    id: pid_dew
+#    name: "PID Dew Level"
+#    sensor: ir_bs
+#    default_target_temperature: 20°C
+#    cool_output: more_dew
+#    heat_output: less_dew
+#    control_parameters:
+#      kp: 0.15
+#      ki: 0.0
+#      kd: 0.0
+
+#button:
+#  - platform: template
+#    name: "PID Submit Values"
+#    on_press:
+#      - climate.pid.set_control_parameters:
+#          id: pid_dew
+#          kp: !lambda |-
+#            return id(kp).state;
+#          ki: !lambda |-
+#            return id(ki).state;
+#          kd: !lambda |-
+#            return id(kd).state;
+
+#interval:
+#  - interval: 10s
+#    then:
+#      - climate.control:
+#          id: pid_dew
+#          mode: HEAT_COOL
+#          target_temperature: !lambda |-
+#            return id(pid_mirror).target_temperature + id(pid_mux).state;
+
+#number:
+#  - platform: template
+#    name: "kP"
+#    id: kp
+#    optimistic: true
+#    min_value: 0.00
+#    max_value: 10.00
+#    initial_value: 0.15
+#    step: 0.001
+#  - platform: template
+#    name: "kI"
+#    id: ki
+#    optimistic: true
+#    min_value: 0.00
+#    max_value: 10.00
+#    initial_value: 0.0
+#    step: 0.0001
+#  - platform: template
+#    name: "kD"
+#    id: kd
+#    optimistic: true
+#    min_value: 0.00
+#    max_value: 10.00
+#    initial_value: 0.0
+#    step: 0.001
